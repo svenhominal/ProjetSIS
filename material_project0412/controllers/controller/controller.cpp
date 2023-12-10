@@ -1,5 +1,3 @@
-// Controller for the robot robot
-
 // Provided libraries 
 #include "pioneer_interface/pioneer_interface.hpp"
 #include "utils/log_data.hpp"
@@ -12,99 +10,37 @@
 #include "serial.hpp"
 #include "signal_analysis.hpp"
 
-/* double sum = 0;
-int j = 0;
-int item = 0;
-double max = 0;
-double positionx[20000] = {0};
-double positiony[20000] = {0};
-double heading;
-
-bool printedFirstLight = false;
-bool printedSecondLight = false; 
-
- void getlight(const Pose& odo, double light){
-
-  if (odo.x < 2){
-    positionx[j] = odo.x;
-    positiony[j] = odo.y;
-    sum = sum + light;
-    j++;
-    if (light > max){
-      max = light;
-      item = j;
-
-    }
-    //printf("Light %.3f", odo.x);
-  }
-  else if (odo.x >=2 && odo.x < 4){
-    if (!printedFirstLight){
-      printf("Highest light intensity of first light  at x = %.3lf, y = %.3lf\n", positionx[item], positiony[item]);
-      printedFirstLight = true;
-
-      sum = 0;
-      j = 0;
-      item = 0;
-      max = 0;
-    }
-    positionx[j] = odo.x;
-    positiony[j] = odo.y; 
-    sum = sum + light;
-    j++;
-    if (light > max){
-      max = light;
-      item = j;
-    }
-  }
-
-  else {
-    if (!printedSecondLight){
-      printf("Highest light intensity of second light  at x = %.3lf, y = %.3lf\n", positionx[item], positiony[item]);
-      printedSecondLight = true;
-
-    }
-  }
-  
-  return ;
-}
-
-*/
-
 struct Light {
   double xStart;
   double xEnd;
   double maxIntensity;
   double posX;
   double posY;
+ 
   bool printed;
 };
 
+double moving_window[SIGNAL_LENGTH]={1};
+double global_max = 2.1;
+double local_max = 2.1;
+double positionx = 0;
+double positiony = 0;
+double old_local_max = 2.1;
+int light_condition = INIT;
+int search_max = 1;
+int time_step_ctr=0; 
+int light_ctr =1;
+bool light_found =  false;
+bool ready = false;
+int good_ctr=0;
+int bad_ctr=0;
 
-Light lights[3]{
-  {0,2,0,0,0,false},
-  {2,4,0,0,0,false},
-  {4,6,0,0,0,false},
-  };
+double omega;
+double speed; 
 
-void getlight(const Pose& pose, double light){
-  for (int i = 0; i < 3; i++){
-    if (pose.x >= lights[i].xStart && pose.x < lights[i].xEnd){
-      if (light > lights[i].maxIntensity){
-        lights[i].maxIntensity = light;
-        lights[i].posX = pose.x;
-        //printf("%3lf", lights[i].posX);
-        lights[i].posY = pose.y;
-      }
-      //printf("Current odometry : x = %3lf, y = %3lf, heading = %.3lf\n", pose.x, pose.y, pose.theta);
-    }
-    if (pose.x >= lights[i].xEnd && !lights[i].printed){
-      printf("Light %d detected ! State is XXX, at x = %3lf, y = %3lf \n", i+1, lights[i].posX, lights[i].posY);
-      lights[i].printed = true;
-    }
-  }
-  return;
-}
-
+int count_acc = 0;
+double mean_acc_x = 0;
+double mean_acc_y = 0;
 
 
 int main(int argc, char **argv) {
@@ -114,55 +50,87 @@ int main(int argc, char **argv) {
   robot.init();
 
   // Initialize an example log file
-  std::string f_example = "example.csv";
-  int         f_example_cols = init_csv(f_example, "time, light, accx, accy, accz,"); // <-- don't forget the comma at the end of the string!!
+  /////int         f_example_cols = init_csv(f_example, "time, light, accx, accy, accz,"); // <-- don't forget the comma at the end of the string!!
 
-  //CSV for the pose with odometry 
+  // CSV for the pose with odometry encoders
+  std:: string f_odometry_enc = "odometry_encoders.csv";
+  int         f_odometry_enc_cols = init_csv(f_odometry_enc, "time, x, y, heading,");
 
-  std:: string f_odometry = "odometry.csv";
-  int         f_odometry_cols = init_csv(f_odometry, "time, x, y, heading");
+  // CSV for the pose with odometry accelerometer
+  std:: string f_odometry_acc = "odometry_accelerometer.csv";
+  int         f_odometry_acc_cols = init_csv(f_odometry_acc, "time, x, y, heading,");
 
-  //Initial pose 
-  Pose pose = {0,0,0};
+  // CSV for the temperature
+  std:: string f_temperature = "temperature.csv";
+  int   f_temperature_cols = init_csv(f_temperature, "sensor id, x, int i=0;y, indoor temperature, outdoor temperature,");
+  
+  std:: string f_data= "data.csv";
+  int f_data_cols= init_csv(f_data, "sensor id, x,y, indoor tempreature, outdoor temperature, time, "); 
+
+  // Initial pose 
+  Pose pose = {0,0,0,0,0};
+  Pose_acc pose_acc= {0,0,0};
+
+  // Delta for the time 
+  double delta_time = 0;
+  double previous_time = 0;
+
+  
+  //double acc_sum[3] = {0, 0, 0};
+  //double acc_window[WINDOW_SIZE][3] = {0};
+  //int count = 0;
+  
 
   while (robot.step() != -1) {
 
-    //////////////////////////////
     // Measurements acquisition //
     //////////////////////////////
     
     double  time = robot.get_time();              // Current time in seconds 
     double* ps_values = robot.get_proximity();    // Measured proximity sensor values (16 values)
     double* wheel_rot = robot.get_encoders();     // Wheel rotations (left, right)
-    double  light = robot.get_light_intensity();  // Light intensity
-    double* imu = robot.get_imu();                // IMU with accelerations and rotation rates (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+    double  light = robot.get_light_intensity(); 
+    double *imu= robot.get_imu();
+    int steptime= robot.get_timestep();
+
+    // Light intensity
 
     ////////////////////
     // Implementation //
     ////////////////////
+ 
 
-
-    //Compute odometry 
     
-
+    
+    delta_time = time-previous_time;
     // DATA ACQUISITION
     double data[PACKET_SIZE];
-    double signal_strength = serial_get_data(robot, data);
+    serial_get_data(robot, data, f_temperature, f_temperature_cols,  &pose,turn_ctr,  f_data, f_data_cols, time);
+    
+    //compute_moving_average(imu_values, acc_sum, acc_window, count);
 
     // NAVIGATION
     double lws = 0.0, rws = 0.0;  // left and right wheel speeds
 
-    //FSM 
+    // FSM 
     fsm(ps_values, lws, rws, light, pose); // finite state machine 
 
-    //Odometry
-    computeOdometry(&pose, wheel_rot[0],wheel_rot[1],robot.get_timestep());
+    // Odometry encoders
+    odometry_encoders(&pose, wheel_rot[0],wheel_rot[1],delta_time);
 
-    //Light
+    // Odometry accelerometer
+    odometry_accelerometer(&pose_acc, imu[0], imu[1], imu[5], delta_time, robot.get_time());
 
-    //Set velocity 
+    // Kalman filters 
+    kalman_filter_odometry(&pose, imu,steptime, speed, omega);
+    kalman_filter_imu(&pose, imu, steptime);
 
-    getlight(pose, light);
+    // Update the time
+    previous_time = time;
+
+    // Light analysis
+    light_analysis(light, moving_window,&pose);
+ 
     robot.set_motors_velocity(lws, rws); // set the wheel velocities
 
 
@@ -171,16 +139,24 @@ int main(int argc, char **argv) {
     //////////////////
 
     // Log the time and light and IMU data in a csv file 
-    log_csv(f_example, f_example_cols, time, light, imu[0], imu[1], imu[2]);
+    //log_csv(f_example, f_example_cols, time, light, imu[0], imu[1], imu[2]);
 
+    //////////////////////////////void kalman_filter(pose * odo)
+  
     //Save data for odometry on a CSV file.
-    log_csv(f_odometry, f_odometry_cols, time, pose.x, pose.y, pose.theta);
-
+    log_csv(f_odometry_enc, f_odometry_enc_cols, time, pose.x, pose.y, pose.theta);
+    log_csv(f_odometry_acc, f_odometry_acc_cols, time, pose_acc.x_acc, pose_acc.y_acc, pose_acc.theta_acc);
+   
+  
+  
   }
-
+    
   // Enter here exit cleanup code.
   close_csv(); // close all opened csv files
 
   return 0;
+
 }
+
+
 
